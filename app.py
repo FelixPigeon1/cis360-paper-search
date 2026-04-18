@@ -1,9 +1,30 @@
-import sqlite3
-import streamlit as st
-from data_import import DB_PATH, init_db
+"""Streamlit UI for the CIS 360 Data Fusion Knowledge System."""
 
-st.set_page_config(page_title="CIS 360 Paper Search", layout="wide")
-st.title("Academic Paper Search")
+from __future__ import annotations
+
+import io
+import os
+
+import pandas as pd
+import streamlit as st
+
+from db import (
+    DB_PATH,
+    delete_db,
+    get_paper_detail,
+    get_stats,
+    import_excel,
+    init_db,
+    query_linkage,
+    query_popular_dataset,
+    query_uncertainty,
+    search_papers,
+)
+
+st.set_page_config(
+    page_title="CIS 360 — Data Fusion Knowledge System",
+    layout="wide",
+)
 
 
 @st.cache_resource
@@ -11,75 +32,280 @@ def get_conn():
     return init_db(DB_PATH)
 
 
-def search_papers(conn: sqlite3.Connection, keywords: list[str]) -> list[dict]:
-    if not keywords:
-        return []
-
-    clauses = []
-    params = []
-    searchable = ["title", "abstract", "keywords", "author", "publication_title", "field_of_study"]
-    for kw in keywords:
-        term = f"%{kw}%"
-        col_conditions = " OR ".join(f"p.{col} LIKE ?" for col in searchable)
-        clauses.append(f"({col_conditions})")
-        params.extend([term] * len(searchable))
-
-    where = " AND ".join(clauses)
-    sql = f"""
-        SELECT p.id, p.doi, p.title, p.author, p.publication_title,
-               p.publication_date, p.url, p.keywords, p.abstract,
-               p.publisher, p.field_of_study, p.is_data_fusion,
-               p.classification_reason, c.name AS contributor
-        FROM papers p
-        LEFT JOIN contributors c ON p.contributor_id = c.id
-        WHERE {where}
-        ORDER BY p.title
-    """
-    cur = conn.execute(sql, params)
-    cols = [d[0] for d in cur.description]
-    return [dict(zip(cols, row)) for row in cur.fetchall()]
+def _truncate(text: str | None, max_len: int = 200) -> str:
+    if text is None:
+        return ""
+    s = str(text)
+    if len(s) <= max_len:
+        return s
+    return s[: max_len - 3] + "..."
 
 
-conn = get_conn()
+def page_home():
+    st.title("🔬 CIS 360 — Data Fusion Knowledge System")
+    try:
+        conn = get_conn()
+        stats = get_stats(conn)
+    except Exception as e:
+        st.error(str(e))
+        return
 
-query = st.text_input("Enter keywords (comma-separated)", placeholder="e.g. data fusion, uncertainty, remote sensing")
+    c1, c2, c3 = st.columns(3)
+    c1.metric("Total Papers", stats["papers"])
+    c2.metric("Total Datasets", stats["datasets"])
+    c3.metric("Total Fusion Methods", stats["methods"])
 
-if query:
-    keywords = [k.strip() for k in query.split(",") if k.strip()]
-    results = search_papers(conn, keywords)
+    if stats["papers"] == 0:
+        st.info("No data loaded yet. Go to Upload Data to get started.")
 
-    st.markdown(f"**{len(results)} result{'s' if len(results) != 1 else ''} found** for: {', '.join(f'`{k}`' for k in keywords)}")
 
-    if results:
-        for paper in results:
-            with st.expander(paper["title"] or "*(no title)*"):
-                col1, col2 = st.columns(2)
-                with col1:
-                    if paper["author"]:
-                        st.markdown(f"**Author(s):** {paper['author']}")
-                    if paper["publication_title"]:
-                        st.markdown(f"**Published in:** {paper['publication_title']}")
-                    if paper["publication_date"]:
-                        st.markdown(f"**Date:** {paper['publication_date']}")
-                    if paper["field_of_study"]:
-                        st.markdown(f"**Field:** {paper['field_of_study']}")
-                    if paper["publisher"]:
-                        st.markdown(f"**Publisher:** {paper['publisher']}")
-                    if paper["contributor"]:
-                        st.markdown(f"**Contributor:** {paper['contributor']}")
-                with col2:
-                    if paper["doi"]:
-                        st.markdown(f"**DOI:** `{paper['doi']}`")
-                    if paper["url"]:
-                        st.markdown(f"**URL:** {paper['url']}")
-                    if paper["keywords"]:
-                        st.markdown(f"**Keywords:** {paper['keywords']}")
-                    if paper["is_data_fusion"]:
-                        st.markdown(f"**Data Fusion:** {paper['is_data_fusion']}")
-                    if paper["classification_reason"]:
-                        st.markdown(f"**Classification Reason:** {paper['classification_reason']}")
-                if paper["abstract"]:
-                    st.markdown("**Abstract:**")
-                    st.write(paper["abstract"])
+def page_upload():
+    st.header("Upload Data")
+    uploaded = st.file_uploader("Upload Excel workbook", type=["xlsx"])
+
+    if uploaded is not None:
+        data = uploaded.getvalue()
+        st.session_state["pending_xlsx"] = data
+
+        st.subheader("Sheet Preview")
+        try:
+            bio_preview = io.BytesIO(data)
+            doi_prev = pd.read_excel(bio_preview, sheet_name="DOI")
+            bio_preview.seek(0)
+            data_prev = pd.read_excel(bio_preview, sheet_name="Data")
+            bio_preview.seek(0)
+            fusion_prev = pd.read_excel(bio_preview, sheet_name="Fusion Method")
+        except Exception as e:
+            st.error(f"Could not read workbook for preview: {e}")
+            return
+
+        t1, t2, t3 = st.tabs(["DOI", "Data", "Fusion Method"])
+        with t1:
+            st.dataframe(doi_prev.head(5), use_container_width=True)
+        with t2:
+            st.dataframe(data_prev.head(5), use_container_width=True)
+        with t3:
+            st.dataframe(fusion_prev.head(5), use_container_width=True)
+
+        if st.button("Import into Database", type="primary"):
+            try:
+                conn = get_conn()
+                summary = import_excel(conn, st.session_state["pending_xlsx"])
+                st.cache_resource.clear()
+                st.success(
+                    f"✅ Imported: {summary['papers']} papers, "
+                    f"{summary['datasets']} datasets, {summary['methods']} methods"
+                )
+            except Exception as e:
+                st.error(str(e))
+
+
+def page_search():
+    st.header("Search Papers")
+    keyword = st.text_input("Search by title, author, or DOI", "")
+
+    if not keyword.strip():
+        st.caption("Enter a search term to find papers.")
+        return
+
+    try:
+        conn = get_conn()
+        results = search_papers(conn, keyword)
+    except Exception as e:
+        st.error(str(e))
+        return
+
+    if not results:
+        st.info("No papers found. Try a different search term.")
+        return
+
+    for paper in results:
+        title = paper.get("title") or "(no title)"
+        with st.expander(title):
+            st.markdown(f"**DOI:** `{paper.get('doi')}`")
+            st.markdown(f"**Author:** {paper.get('author') or '—'}")
+
+            detail = get_paper_detail(conn, paper["doi"])
+            tab_ds, tab_fm = st.tabs(["📊 Datasets", "⚙️ Fusion Methods"])
+
+            with tab_ds:
+                ds_rows = detail.get("datasets") or []
+                if ds_rows:
+                    st.dataframe(
+                        pd.DataFrame(ds_rows),
+                        use_container_width=True,
+                        hide_index=True,
+                    )
+                else:
+                    st.caption("No datasets recorded for this paper.")
+
+            with tab_fm:
+                fm_rows = detail.get("methods") or []
+                if fm_rows:
+                    display_fm = []
+                    for m in fm_rows:
+                        display_fm.append(
+                            {
+                                "method_name": m.get("method_name"),
+                                "u1": m.get("u1"),
+                                "u3": m.get("u3"),
+                                "description": _truncate(m.get("description")),
+                            }
+                        )
+                    st.dataframe(
+                        pd.DataFrame(display_fm),
+                        use_container_width=True,
+                        hide_index=True,
+                    )
+                else:
+                    st.caption("No fusion methods recorded for this paper.")
+
+
+def page_queries():
+    st.header("Knowledge Queries")
+
+    with st.expander("🔗 Linkage Query", expanded=True):
+        st.caption(
+            "Find all fusion methods applied to papers that use both Dataset A and Dataset B"
+        )
+        c1, c2 = st.columns(2)
+        with c1:
+            da = st.text_input("Dataset A name", key="link_a")
+        with c2:
+            dataset_b = st.text_input("Dataset B name", key="link_b")
+        if st.button("Search", key="link_search"):
+            try:
+                conn = get_conn()
+                rows = query_linkage(conn, da, dataset_b)
+                if not rows:
+                    st.info("No matching fusion methods found.")
+                else:
+                    st.dataframe(
+                        pd.DataFrame(rows),
+                        use_container_width=True,
+                        hide_index=True,
+                    )
+            except Exception as e:
+                st.error(str(e))
+
+    with st.expander("⚠️ Uncertainty Query", expanded=True):
+        st.caption(
+            "Find all papers reporting a specific uncertainty type for a given sensor/keyword"
+        )
+        umap = {
+            "U1 – Conception": "U1",
+            "U2 – Measurement": "U2",
+            "U3 – Analysis": "U3",
+        }
+        choice = st.selectbox(
+            "Uncertainty Type",
+            list(umap.keys()),
+        )
+        sk = st.text_input("Sensor or keyword to search", key="unc_kw")
+        if st.button("Search", key="unc_search"):
+            try:
+                conn = get_conn()
+                rows = query_uncertainty(conn, umap[choice], sk)
+                if not rows:
+                    st.info("No matching papers found.")
+                else:
+                    out = []
+                    for r in rows:
+                        out.append(
+                            {
+                                "Paper Title": r.get("title"),
+                                "Author": r.get("author"),
+                                "DOI": r.get("doi"),
+                                "Uncertainty Text": r.get("uncertainty_text"),
+                            }
+                        )
+                    st.dataframe(
+                        pd.DataFrame(out),
+                        use_container_width=True,
+                        hide_index=True,
+                    )
+            except Exception as e:
+                st.error(str(e))
+
+    with st.expander("🏆 Popular Dataset Query", expanded=True):
+        st.caption("Which dataset appears most often across fusion methods?")
+        if st.button("Run Query", key="pop_run"):
+            try:
+                conn = get_conn()
+                rows = query_popular_dataset(conn)
+                if not rows:
+                    st.info("No data available. Import a workbook first.")
+                else:
+                    df = pd.DataFrame(rows)
+                    st.dataframe(df, use_container_width=True, hide_index=True)
+                    chart_df = df[["data_name", "method_count"]].set_index("data_name")
+                    st.bar_chart(chart_df)
+            except Exception as e:
+                st.error(str(e))
+
+
+def page_db_mgmt():
+    st.header("Database Management")
+    abs_path = os.path.abspath(DB_PATH)
+    st.markdown(f"**Database file:** `{abs_path}`")
+
+    size = os.path.getsize(abs_path) if os.path.isfile(abs_path) else 0
+    st.markdown(f"**File size:** {size:,} bytes")
+
+    st.warning("This will permanently delete all imported data.")
+    if st.button("🗑️ Delete & Reset Database", type="primary"):
+        try:
+            st.cache_resource.clear()
+            delete_db(DB_PATH)
+            st.success("Database cleared.")
+            st.rerun()
+        except Exception as e:
+            st.error(str(e))
+
+    try:
+        conn = get_conn()
+        stats = get_stats(conn)
+        st.subheader("Row counts")
+        st.dataframe(
+            pd.DataFrame(
+                [
+                    {"table": "papers", "rows": stats["papers"]},
+                    {"table": "datasets", "rows": stats["datasets"]},
+                    {"table": "fusion_methods", "rows": stats["methods"]},
+                ]
+            ),
+            use_container_width=True,
+            hide_index=True,
+        )
+    except Exception as e:
+        st.error(str(e))
+
+
+def main():
+    st.sidebar.title("Navigation")
+    page = st.sidebar.radio(
+        "Go to",
+        [
+            "Home / Dashboard",
+            "Upload Data",
+            "Search Papers",
+            "Knowledge Queries",
+            "Database Management",
+        ],
+        label_visibility="collapsed",
+    )
+
+    if page == "Home / Dashboard":
+        page_home()
+    elif page == "Upload Data":
+        page_upload()
+    elif page == "Search Papers":
+        page_search()
+    elif page == "Knowledge Queries":
+        page_queries()
     else:
-        st.info("No papers matched your search. Try different or fewer keywords.")
+        page_db_mgmt()
+
+
+if __name__ == "__main__":
+    main()
