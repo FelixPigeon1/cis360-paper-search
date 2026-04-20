@@ -59,58 +59,7 @@ def page_home():
     if stats["papers"] == 0:
         st.info("No data loaded yet. Go to Upload Data to get started.")
 
-
-def page_upload():
-    st.header("Upload Data")
-    uploaded = st.file_uploader("Upload Excel workbook or CSV file", type=["xlsx", "csv"])
-
-    if uploaded is not None:
-        data = uploaded.getvalue()
-
-        if normalize_sheet_names(data) == None:
-            st.error("Workbook must contain sheets named 'DOI', 'Data', and 'Fusion Method'")
-            return
-        else:
-            doi_title, data_title, fusion_title = normalize_sheet_names(data)
-            
-
-        st.session_state["pending_xlsx"] = data
-
-        st.subheader("Sheet Preview")
-        try:
-            bio_preview = io.BytesIO(data)
-            doi_prev = pd.read_excel(bio_preview, sheet_name=doi_title)
-            bio_preview.seek(0)
-            data_prev = pd.read_excel(bio_preview, sheet_name=data_title)
-            bio_preview.seek(0)
-            fusion_prev = pd.read_excel(bio_preview, sheet_name=fusion_title)
-        except Exception as e:
-            st.error(f"Could not read workbook for preview: {e}")
-            return
-
-        t1, t2, t3 = st.tabs(["DOI", "Data", "Fusion Method"])
-        with t1:
-            st.dataframe(doi_prev.head(5), use_container_width=True)
-        with t2:
-            st.dataframe(data_prev.head(5), use_container_width=True)
-        with t3:
-            st.dataframe(fusion_prev.head(5), use_container_width=True)
-
-        if st.button("Import into Database", type="primary"):
-            try:
-                conn = get_conn()
-                summary = import_excel(conn, st.session_state["pending_xlsx"])
-                st.cache_resource.clear()
-                st.success(
-                    f"✅ Imported: {summary['papers']} papers, "
-                    f"{summary['datasets']} datasets, {summary['methods']} methods"
-                )
-            except Exception as e:
-                st.error(str(e))
-
-
-def page_search():
-    st.header("Search Papers")
+        st.header("Search Papers")
     keyword = st.text_input("Search by title, author, or DOI", "")
 
     if not keyword.strip():
@@ -168,6 +117,55 @@ def page_search():
                     )
                 else:
                     st.caption("No fusion methods recorded for this paper.")
+
+
+def page_upload():
+    st.header("Upload Data")
+    uploaded = st.file_uploader("Upload Excel workbook or CSV file", type=["xlsx", "csv"])
+
+    if uploaded is not None:
+        data = uploaded.getvalue()
+
+        if normalize_sheet_names(data) == None:
+            st.error("Workbook must contain sheets named 'DOI', 'Data', and 'Fusion Method'")
+            return
+        else:
+            doi_title, data_title, fusion_title = normalize_sheet_names(data)
+            
+
+        st.session_state["pending_xlsx"] = data
+
+        st.subheader("Sheet Preview")
+        try:
+            bio_preview = io.BytesIO(data)
+            doi_prev = pd.read_excel(bio_preview, sheet_name=doi_title)
+            bio_preview.seek(0)
+            data_prev = pd.read_excel(bio_preview, sheet_name=data_title)
+            bio_preview.seek(0)
+            fusion_prev = pd.read_excel(bio_preview, sheet_name=fusion_title)
+        except Exception as e:
+            st.error(f"Could not read workbook for preview: {e}")
+            return
+
+        t1, t2, t3 = st.tabs(["DOI", "Data", "Fusion Method"])
+        with t1:
+            st.dataframe(doi_prev.head(5), use_container_width=True)
+        with t2:
+            st.dataframe(data_prev.head(5), use_container_width=True)
+        with t3:
+            st.dataframe(fusion_prev.head(5), use_container_width=True)
+
+        if st.button("Import into Database", type="primary"):
+            try:
+                conn = get_conn()
+                summary = import_excel(conn, st.session_state["pending_xlsx"])
+                st.cache_resource.clear()
+                st.success(
+                    f"✅ Imported: {summary['papers']} papers, "
+                    f"{summary['datasets']} datasets, {summary['methods']} methods"
+                )
+            except Exception as e:
+                st.error(str(e))
 
 
 def page_queries():
@@ -297,7 +295,6 @@ def main():
         [
             "Home / Dashboard",
             "Upload Data",
-            "Search Papers",
             "Knowledge Queries",
             "Database Management",
         ],
@@ -308,8 +305,6 @@ def main():
         page_home()
     elif page == "Upload Data":
         page_upload()
-    elif page == "Search Papers":
-        page_search()
     elif page == "Knowledge Queries":
         page_queries()
     else:
