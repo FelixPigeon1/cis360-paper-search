@@ -6,6 +6,7 @@ import io
 import os
 import sqlite3
 from typing import Any
+import re
 
 import pandas as pd
 
@@ -72,13 +73,49 @@ def _drop_empty_doi(df: pd.DataFrame) -> pd.DataFrame:
     return df.loc[mask].copy()
 
 
+def normalize_sheet_names (file_bytes: bytes) -> list[str]:
+        
+        all_sheets = pd.read_excel(io.BytesIO(file_bytes), sheet_name=None)
+        doi_title = None
+        data_title = None
+        fusion_title = None
+
+        for sheet in list(all_sheets.keys()):
+            if doi_title is None:
+                match = re.search(r"(?i)^\s*doi\s*$", sheet)
+                if match is not None:
+                    doi_title = match
+                    continue
+            if data_title is None:
+                match = re.search(r"(?i)^\s*data\s*$", sheet)
+                if match is not None:
+                    data_title = match
+                    continue
+            if fusion_title is None:
+                match = re.search(r"(?i)^\s*fusion.?method\s*$", sheet)
+                if match is not None:
+                    fusion_title = re.search(r"(?i)^\s*fusion.?method\s*$", sheet)
+                    continue
+        
+
+        print(f"DEBUG: Found sheet names - DOI: {doi_title.group(0) if doi_title else None}, Data: {data_title.group(0) if data_title else None}, Fusion Method: {fusion_title.group(0) if fusion_title else None}")
+        if not all([doi_title, data_title, fusion_title]):
+            return None
+        
+        return doi_title.group(0), data_title.group(0), fusion_title.group(0)
+
 def import_excel(conn: sqlite3.Connection, file_bytes: bytes) -> dict[str, int]:
     bio = io.BytesIO(file_bytes)
-    doi_df = pd.read_excel(bio, sheet_name="DOI")
+    doi_title, data_title, fusion_title = normalize_sheet_names(file_bytes)
+
+    if not all([doi_title, data_title, fusion_title]):
+        raise ValueError("Invalid sheet names in the uploaded file")
+    
+    doi_df = pd.read_excel(bio, sheet_name=doi_title)
     bio.seek(0)
-    data_df = pd.read_excel(bio, sheet_name="Data")
+    data_df = pd.read_excel(bio, sheet_name=data_title)
     bio.seek(0)
-    fusion_df = pd.read_excel(bio, sheet_name="Fusion Method")
+    fusion_df = pd.read_excel(bio, sheet_name=fusion_title)
 
     doi_df = _strip_object_cells(_normalize_columns(doi_df))
     data_df = _strip_object_cells(_normalize_columns(data_df))
@@ -174,6 +211,83 @@ def import_excel(conn: sqlite3.Connection, file_bytes: bytes) -> dict[str, int]:
             ),
         )
         methods_inserted += 1
+
+    conn.commit()
+    return {
+        "papers": papers_inserted,
+        "datasets": datasets_inserted,
+        "methods": methods_inserted,
+    }
+
+
+def import_csv(conn: sqlite3.Connection, file_bytes: bytes) -> dict[str, int]:
+    bio = io.BytesIO(file_bytes)
+    df = pd.read_csv(bio)
+    df = _strip_object_cells(_normalize_columns(df))
+    df = _drop_empty_doi(df)
+
+    expected_cols = {"doi", "title", "author", "data_name", "u2", "method_name", "description", "u1", "u3"}
+    for col in expected_cols - set(df.columns):
+        df[col] = None
+
+    all_dois = set(df["doi"].dropna().astype(str).str.strip().tolist())
+
+    cur = conn.cursor()
+    for doi in all_dois:
+        cur.execute("DELETE FROM datasets WHERE doi = ?", (doi,))
+        cur.execute("DELETE FROM fusion_methods WHERE doi = ?", (doi,))
+
+    papers_inserted = 0
+    datasets_inserted = 0
+    methods_inserted = 0
+
+    for _, row in df.iterrows():
+        d = row.get("doi")
+        if d is None or str(d).strip() == "":
+            continue
+        doi_str = str(d).strip()
+        cur.execute(
+            """
+            INSERT OR IGNORE INTO papers (doi, title, author)
+            VALUES (?, ?, ?)
+            """,
+            (
+                doi_str,
+                None if pd.isna(row.get("title")) else str(row.get("title")),
+                None if pd.isna(row.get("author")) else str(row.get("author")),
+            ),
+        )
+        papers_inserted += 1
+
+        if not pd.isna(row.get("data_name")) or not pd.isna(row.get("u2")):
+            cur.execute(
+                """
+                INSERT INTO datasets (doi, data_name, u2)
+                VALUES (?, ?, ?)
+                """,
+                (
+                    doi_str,
+                    None if pd.isna(row.get("data_name")) else str(row.get("data_name")),
+                    None if pd.isna(row.get("u2")) else str(row.get("u2")),
+                ),
+            )
+            datasets_inserted += 1
+
+        if not pd.isna(row.get("method_name")) or not pd.isna(row.get("description")) or not pd.isna(row.get("u1")) or not pd.isna(row.get("u3")):
+            cur.execute(
+                """
+                INSERT INTO fusion_methods (doi, method_name, description, u1, u3)
+                VALUES (?, ?, ?, ?, ?)
+                """,
+                (
+                    doi_str,
+                    None if pd.isna(row.get("method_name")) else str(row.get("method_name")),
+                    None if pd.isna(row.get("description")) else str(row.get("description")),
+                    None if pd.isna(row.get("u1")) else str(row.get("u1")),
+                    None if pd.isna(row.get("u3")) else str(row.get("u3")),
+                ),
+            )
+            methods_inserted += 1
 
     conn.commit()
     return {

@@ -4,15 +4,16 @@ from __future__ import annotations
 
 import io
 import os
-
 import pandas as pd
 import streamlit as st
+import re
 
 from db import (
     DB_PATH,
     delete_db,
     get_paper_detail,
     get_stats,
+    normalize_sheet_names,
     import_excel,
     init_db,
     query_linkage,
@@ -22,7 +23,7 @@ from db import (
 )
 
 st.set_page_config(
-    page_title="CIS 360 — Data Fusion Knowledge System",
+    page_title="Data Fusion Knowledge System",
     layout="wide",
 )
 
@@ -61,20 +62,28 @@ def page_home():
 
 def page_upload():
     st.header("Upload Data")
-    uploaded = st.file_uploader("Upload Excel workbook", type=["xlsx"])
+    uploaded = st.file_uploader("Upload Excel workbook or CSV file", type=["xlsx", "csv"])
 
     if uploaded is not None:
         data = uploaded.getvalue()
+
+        if normalize_sheet_names(data) == None:
+            st.error("Workbook must contain sheets named 'DOI', 'Data', and 'Fusion Method'")
+            return
+        else:
+            doi_title, data_title, fusion_title = normalize_sheet_names(data)
+            
+
         st.session_state["pending_xlsx"] = data
 
         st.subheader("Sheet Preview")
         try:
             bio_preview = io.BytesIO(data)
-            doi_prev = pd.read_excel(bio_preview, sheet_name="DOI")
+            doi_prev = pd.read_excel(bio_preview, sheet_name=doi_title)
             bio_preview.seek(0)
-            data_prev = pd.read_excel(bio_preview, sheet_name="Data")
+            data_prev = pd.read_excel(bio_preview, sheet_name=data_title)
             bio_preview.seek(0)
-            fusion_prev = pd.read_excel(bio_preview, sheet_name="Fusion Method")
+            fusion_prev = pd.read_excel(bio_preview, sheet_name=fusion_title)
         except Exception as e:
             st.error(f"Could not read workbook for preview: {e}")
             return
