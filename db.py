@@ -94,29 +94,179 @@ def normalize_sheet_names (file_bytes: bytes) -> list[str]:
             if fusion_title is None:
                 match = re.search(r"(?i)^\s*fusion.?method\s*$", sheet)
                 if match is not None:
-                    fusion_title = re.search(r"(?i)^\s*fusion.?method\s*$", sheet)
+                    fusion_title = match
                     continue
         
 
-        print(f"DEBUG: Found sheet names - DOI: {doi_title.group(0) if doi_title else None}, Data: {data_title.group(0) if data_title else None}, Fusion Method: {fusion_title.group(0) if fusion_title else None}")
         if not all([doi_title, data_title, fusion_title]):
             return None
-        
+
         return doi_title.group(0), data_title.group(0), fusion_title.group(0)
 
-def import_excel(conn: sqlite3.Connection, file_bytes: bytes) -> dict[str, int]:
-    bio = io.BytesIO(file_bytes)
-    doi_title, data_title, fusion_title = normalize_sheet_names(file_bytes)
 
-    if not all([doi_title, data_title, fusion_title]):
-        raise ValueError("Invalid sheet names in the uploaded file")
-    
-    doi_df = pd.read_excel(bio, sheet_name=doi_title)
-    bio.seek(0)
-    data_df = pd.read_excel(bio, sheet_name=data_title)
-    bio.seek(0)
-    fusion_df = pd.read_excel(bio, sheet_name=fusion_title)
+def _str_or_none(val: Any) -> str | None:
+    if val is None or (isinstance(val, float) and pd.isna(val)):
+        return None
+    s = str(val).strip()
+    return s if s else None
 
+
+def _fill_blank(existing: str | None, incoming: Any) -> str | None:
+    """If existing text is missing, take CSV; otherwise keep the stored value."""
+    if existing is not None and str(existing).strip() != "":
+        return str(existing).strip()
+    return _str_or_none(incoming)
+
+
+def _ensure_paper_stub(cur: sqlite3.Cursor, doi: str) -> None:
+    """Ensure a papers row exists so FK inserts on datasets / fusion_methods succeed."""
+    cur.execute(
+        "INSERT OR IGNORE INTO papers (doi, title, author) VALUES (?, NULL, NULL)",
+        (doi,),
+    )
+
+
+def _merge_paper_row(cur: sqlite3.Cursor, doi: str, title: Any, author: Any) -> None:
+    cur.execute("SELECT title, author FROM papers WHERE doi = ?", (doi,))
+    row = cur.fetchone()
+    if row is None:
+        cur.execute(
+            "INSERT INTO papers (doi, title, author) VALUES (?, ?, ?)",
+            (
+                doi,
+                _str_or_none(title),
+                _str_or_none(author),
+            ),
+        )
+        return
+    et, ea = row[0], row[1]
+    nt = _fill_blank(et, title)
+    na = _fill_blank(ea, author)
+    cur.execute(
+        "UPDATE papers SET title = ?, author = ? WHERE doi = ?",
+        (nt, na, doi),
+    )
+
+
+def _dataset_key(data_name: Any) -> str:
+    return _str_or_none(data_name) or ""
+
+
+def _merge_dataset_row(cur: sqlite3.Cursor, doi: str, data_name: Any, u2: Any) -> None:
+    _ensure_paper_stub(cur, doi)
+    key = _dataset_key(data_name)
+    cur.execute(
+        """
+        SELECT id, data_name, u2 FROM datasets
+        WHERE doi = ? AND TRIM(IFNULL(data_name, '')) = ?
+        """,
+        (doi, key),
+    )
+    existing = cur.fetchone()
+    dn_store = _str_or_none(data_name)
+    u2_in = _str_or_none(u2)
+    if existing:
+        rid, dn_old, u2_old = existing[0], existing[1], existing[2]
+        dn_new = _fill_blank(dn_old, data_name)
+        u2_new = _fill_blank(u2_old, u2)
+        cur.execute(
+            "UPDATE datasets SET data_name = ?, u2 = ? WHERE id = ?",
+            (dn_new, u2_new, rid),
+        )
+        return
+    cur.execute(
+        """
+        INSERT INTO datasets (doi, data_name, u2)
+        VALUES (?, ?, ?)
+        """,
+        (doi, dn_store, u2_in),
+    )
+
+
+def _method_key(method_name: Any) -> str:
+    return _str_or_none(method_name) or ""
+
+
+def _merge_fusion_row(
+    cur: sqlite3.Cursor,
+    doi: str,
+    method_name: Any,
+    description: Any,
+    u1: Any,
+    u3: Any,
+) -> None:
+    _ensure_paper_stub(cur, doi)
+    key = _method_key(method_name)
+    cur.execute(
+        """
+        SELECT id, method_name, description, u1, u3 FROM fusion_methods
+        WHERE doi = ? AND TRIM(IFNULL(method_name, '')) = ?
+        """,
+        (doi, key),
+    )
+    existing = cur.fetchone()
+    mn_store = _str_or_none(method_name)
+    if existing:
+        rid, mn_old, d0, u1_old, u3_old = (
+            existing[0],
+            existing[1],
+            existing[2],
+            existing[3],
+            existing[4],
+        )
+        mn_new = _fill_blank(mn_old, method_name)
+        d_new = _fill_blank(d0, description)
+        u1_new = _fill_blank(u1_old, u1)
+        u3_new = _fill_blank(u3_old, u3)
+        cur.execute(
+            """
+            UPDATE fusion_methods
+            SET method_name = ?, description = ?, u1 = ?, u3 = ?
+            WHERE id = ?
+            """,
+            (mn_new, d_new, u1_new, u3_new, rid),
+        )
+        return
+    cur.execute(
+        """
+        INSERT INTO fusion_methods (doi, method_name, description, u1, u3)
+        VALUES (?, ?, ?, ?, ?)
+        """,
+        (
+            doi,
+            mn_store,
+            _str_or_none(description),
+            _str_or_none(u1),
+            _str_or_none(u3),
+        ),
+    )
+
+
+def classify_csv_bundle_role(filename: str) -> str | None:
+    """
+    Map a CSV filename to its logical table: doi, data, or fusion.
+    Matches DOI.csv, Data.csv, Fusion Method.csv, fusion_method.csv, etc.
+    """
+    stem = os.path.splitext(os.path.basename(filename))[0].lower().strip()
+    stem = re.sub(r"[\s\-]+", "_", stem)
+    if stem == "doi":
+        return "doi"
+    if stem == "data":
+        return "data"
+    if stem in ("fusion_method", "fusionmethod", "fusion"):
+        return "fusion"
+    return None
+
+
+def import_joined_tables(
+    conn: sqlite3.Connection,
+    doi_df: pd.DataFrame,
+    data_df: pd.DataFrame,
+    fusion_df: pd.DataFrame,
+) -> dict[str, int]:
+    """
+    Import the three logical tables joined on DOI (same rules as Excel sheets).
+    """
     doi_df = _strip_object_cells(_normalize_columns(doi_df))
     data_df = _strip_object_cells(_normalize_columns(data_df))
     fusion_df = _strip_object_cells(_normalize_columns(fusion_df))
@@ -220,7 +370,138 @@ def import_excel(conn: sqlite3.Connection, file_bytes: bytes) -> dict[str, int]:
     }
 
 
+def import_joined_tables_enrich(
+    conn: sqlite3.Connection,
+    doi_df: pd.DataFrame,
+    data_df: pd.DataFrame,
+    fusion_df: pd.DataFrame,
+) -> dict[str, int]:
+    """
+    Merge CSV-style data into existing rows by DOI: update/fill blanks, insert only
+    when no matching row exists. Does not delete existing dataset or fusion rows.
+    """
+    doi_df = _strip_object_cells(_normalize_columns(doi_df))
+    data_df = _strip_object_cells(_normalize_columns(data_df))
+    fusion_df = _strip_object_cells(_normalize_columns(fusion_df))
+
+    doi_df = _drop_empty_doi(doi_df)
+    data_df = _drop_empty_doi(data_df)
+    fusion_df = _drop_empty_doi(fusion_df)
+
+    expected_doi = {"doi", "title", "author"}
+    expected_data = {"doi", "data_name", "u2"}
+    expected_fusion = {"doi", "method_name", "description", "u1", "u3"}
+
+    for col in expected_doi - set(doi_df.columns):
+        doi_df[col] = None
+    for col in expected_data - set(data_df.columns):
+        data_df[col] = None
+    for col in expected_fusion - set(fusion_df.columns):
+        fusion_df[col] = None
+
+    cur = conn.cursor()
+    papers_n = 0
+    for _, row in doi_df.iterrows():
+        d = row.get("doi")
+        if d is None or str(d).strip() == "":
+            continue
+        ds = str(d).strip()
+        _merge_paper_row(cur, ds, row.get("title"), row.get("author"))
+        papers_n += 1
+
+    datasets_n = 0
+    for _, row in data_df.iterrows():
+        d = row.get("doi")
+        if d is None or str(d).strip() == "":
+            continue
+        ds = str(d).strip()
+        _merge_dataset_row(cur, ds, row.get("data_name"), row.get("u2"))
+        datasets_n += 1
+
+    methods_n = 0
+    for _, row in fusion_df.iterrows():
+        d = row.get("doi")
+        if d is None or str(d).strip() == "":
+            continue
+        fd = str(d).strip()
+        _merge_fusion_row(
+            cur,
+            fd,
+            row.get("method_name"),
+            row.get("description"),
+            row.get("u1"),
+            row.get("u3"),
+        )
+        methods_n += 1
+
+    conn.commit()
+    return {"papers": papers_n, "datasets": datasets_n, "methods": methods_n}
+
+
+def import_excel(conn: sqlite3.Connection, file_bytes: bytes) -> dict[str, int]:
+    bio = io.BytesIO(file_bytes)
+    doi_title, data_title, fusion_title = normalize_sheet_names(file_bytes)
+
+    if not all([doi_title, data_title, fusion_title]):
+        raise ValueError("Invalid sheet names in the uploaded file")
+
+    doi_df = pd.read_excel(bio, sheet_name=doi_title)
+    bio.seek(0)
+    data_df = pd.read_excel(bio, sheet_name=data_title)
+    bio.seek(0)
+    fusion_df = pd.read_excel(bio, sheet_name=fusion_title)
+
+    return import_joined_tables(conn, doi_df, data_df, fusion_df)
+
+
+def import_csv_bundle(
+    conn: sqlite3.Connection, named_files: list[tuple[str, bytes]]
+) -> dict[str, int]:
+    """
+    Import three CSV files (DOI, Data, Fusion Method), joined on DOI.
+    Enriches existing rows by DOI instead of replacing child tables; filenames must
+    map uniquely to doi / data / fusion (see classify_csv_bundle_role).
+    """
+    if len(named_files) != 3:
+        raise ValueError("CSV bundle import requires exactly three CSV files.")
+
+    roles: dict[str, tuple[str, bytes]] = {}
+    for name, b in named_files:
+        role = classify_csv_bundle_role(name)
+        if role is None:
+            raise ValueError(
+                f"Unrecognized CSV bundle file name: {name!r}. "
+                "Expected names like DOI.csv, Data.csv, and Fusion Method.csv."
+            )
+        if role in roles:
+            raise ValueError(
+                f"Duplicate role {role!r}: {name!r} conflicts with {roles[role][0]!r}."
+            )
+        roles[role] = (name, b)
+
+    missing = {"doi", "data", "fusion"} - set(roles.keys())
+    if missing:
+        raise ValueError(
+            "CSV bundle needs DOI, Data, and Fusion Method tables. "
+            f"Missing: {', '.join(sorted(missing))}."
+        )
+
+    def _read_csv(raw: bytes) -> pd.DataFrame:
+        return pd.read_csv(io.BytesIO(raw), encoding="utf-8-sig")
+
+    doi_df = _read_csv(roles["doi"][1])
+    data_df = _read_csv(roles["data"][1])
+    fusion_df = _read_csv(roles["fusion"][1])
+
+    return import_joined_tables_enrich(conn, doi_df, data_df, fusion_df)
+
+
 def import_csv(conn: sqlite3.Connection, file_bytes: bytes) -> dict[str, int]:
+    """
+    Single combined CSV: merge by DOI into papers, datasets, and fusion_methods.
+    Existing rows are enriched (non-empty CSV values fill blanks); duplicate
+    (doi, data_name) / (doi, method_name) keys update the same row instead of inserting again.
+    """
     bio = io.BytesIO(file_bytes)
     df = pd.read_csv(bio)
     df = _strip_object_cells(_normalize_columns(df))
@@ -230,71 +511,44 @@ def import_csv(conn: sqlite3.Connection, file_bytes: bytes) -> dict[str, int]:
     for col in expected_cols - set(df.columns):
         df[col] = None
 
-    all_dois = set(df["doi"].dropna().astype(str).str.strip().tolist())
-
     cur = conn.cursor()
-    for doi in all_dois:
-        cur.execute("DELETE FROM datasets WHERE doi = ?", (doi,))
-        cur.execute("DELETE FROM fusion_methods WHERE doi = ?", (doi,))
-
-    papers_inserted = 0
-    datasets_inserted = 0
-    methods_inserted = 0
+    papers_n = 0
+    datasets_n = 0
+    methods_n = 0
 
     for _, row in df.iterrows():
         d = row.get("doi")
         if d is None or str(d).strip() == "":
             continue
         doi_str = str(d).strip()
-        cur.execute(
-            """
-            INSERT OR IGNORE INTO papers (doi, title, author)
-            VALUES (?, ?, ?)
-            """,
-            (
-                doi_str,
-                None if pd.isna(row.get("title")) else str(row.get("title")),
-                None if pd.isna(row.get("author")) else str(row.get("author")),
-            ),
+
+        _merge_paper_row(cur, doi_str, row.get("title"), row.get("author"))
+        papers_n += 1
+
+        has_ds = any(
+            _str_or_none(row.get(c)) is not None for c in ("data_name", "u2")
         )
-        papers_inserted += 1
+        if has_ds:
+            _merge_dataset_row(cur, doi_str, row.get("data_name"), row.get("u2"))
+            datasets_n += 1
 
-        if not pd.isna(row.get("data_name")) or not pd.isna(row.get("u2")):
-            cur.execute(
-                """
-                INSERT INTO datasets (doi, data_name, u2)
-                VALUES (?, ?, ?)
-                """,
-                (
-                    doi_str,
-                    None if pd.isna(row.get("data_name")) else str(row.get("data_name")),
-                    None if pd.isna(row.get("u2")) else str(row.get("u2")),
-                ),
+        has_fm = any(
+            _str_or_none(row.get(c)) is not None
+            for c in ("method_name", "description", "u1", "u3")
+        )
+        if has_fm:
+            _merge_fusion_row(
+                cur,
+                doi_str,
+                row.get("method_name"),
+                row.get("description"),
+                row.get("u1"),
+                row.get("u3"),
             )
-            datasets_inserted += 1
-
-        if not pd.isna(row.get("method_name")) or not pd.isna(row.get("description")) or not pd.isna(row.get("u1")) or not pd.isna(row.get("u3")):
-            cur.execute(
-                """
-                INSERT INTO fusion_methods (doi, method_name, description, u1, u3)
-                VALUES (?, ?, ?, ?, ?)
-                """,
-                (
-                    doi_str,
-                    None if pd.isna(row.get("method_name")) else str(row.get("method_name")),
-                    None if pd.isna(row.get("description")) else str(row.get("description")),
-                    None if pd.isna(row.get("u1")) else str(row.get("u1")),
-                    None if pd.isna(row.get("u3")) else str(row.get("u3")),
-                ),
-            )
-            methods_inserted += 1
+            methods_n += 1
 
     conn.commit()
-    return {
-        "papers": papers_inserted,
-        "datasets": datasets_inserted,
-        "methods": methods_inserted,
-    }
+    return {"papers": papers_n, "datasets": datasets_n, "methods": methods_n}
 
 
 def delete_db(db_path: str) -> None:
@@ -315,6 +569,20 @@ def get_stats(conn: sqlite3.Connection) -> dict[str, int]:
     return {"papers": papers, "datasets": datasets, "methods": methods}
 
 
+# User-facing label -> internal key (used for search + optional display filter)
+SEARCHABLE_ATTRIBUTES: list[tuple[str, str]] = [
+    ("Paper title", "title"),
+    ("Author", "author"),
+    ("DOI", "doi"),
+    ("Dataset name", "data_name"),
+    ("U2 — measurement uncertainty", "u2"),
+    ("Fusion method name", "method_name"),
+    ("Method description", "description"),
+    ("U1 — conception uncertainty", "u1"),
+    ("U3 — analysis uncertainty", "u3"),
+]
+
+
 def search_papers(conn: sqlite3.Connection, keyword: str) -> list[dict[str, Any]]:
     kw = keyword.strip()
     if not kw:
@@ -329,6 +597,77 @@ def search_papers(conn: sqlite3.Connection, keyword: str) -> list[dict[str, Any]
         """,
         (term, term, term),
     )
+    rows = cur.fetchall()
+    return [{"doi": r[0], "title": r[1], "author": r[2]} for r in rows]
+
+
+def search_papers_by_attribute(
+    conn: sqlite3.Connection, attribute: str, keyword: str
+) -> list[dict[str, Any]]:
+    """Return distinct papers whose chosen text field matches keyword (LIKE %keyword%)."""
+    valid = {k for _, k in SEARCHABLE_ATTRIBUTES}
+    if attribute not in valid:
+        return []
+    kw = keyword.strip()
+    if not kw:
+        return []
+    term = f"%{kw}%"
+
+    if attribute == "title":
+        sql = """
+            SELECT DISTINCT p.doi, p.title, p.author FROM papers p
+            WHERE p.title LIKE ? ORDER BY COALESCE(p.title, ''), p.doi
+        """
+    elif attribute == "author":
+        sql = """
+            SELECT DISTINCT p.doi, p.title, p.author FROM papers p
+            WHERE p.author LIKE ? ORDER BY COALESCE(p.title, ''), p.doi
+        """
+    elif attribute == "doi":
+        sql = """
+            SELECT DISTINCT p.doi, p.title, p.author FROM papers p
+            WHERE p.doi LIKE ? ORDER BY COALESCE(p.title, ''), p.doi
+        """
+    elif attribute == "data_name":
+        sql = """
+            SELECT DISTINCT p.doi, p.title, p.author FROM papers p
+            INNER JOIN datasets d ON d.doi = p.doi
+            WHERE d.data_name LIKE ? ORDER BY COALESCE(p.title, ''), p.doi
+        """
+    elif attribute == "u2":
+        sql = """
+            SELECT DISTINCT p.doi, p.title, p.author FROM papers p
+            INNER JOIN datasets d ON d.doi = p.doi
+            WHERE d.u2 LIKE ? ORDER BY COALESCE(p.title, ''), p.doi
+        """
+    elif attribute == "method_name":
+        sql = """
+            SELECT DISTINCT p.doi, p.title, p.author FROM papers p
+            INNER JOIN fusion_methods fm ON fm.doi = p.doi
+            WHERE fm.method_name LIKE ? ORDER BY COALESCE(p.title, ''), p.doi
+        """
+    elif attribute == "description":
+        sql = """
+            SELECT DISTINCT p.doi, p.title, p.author FROM papers p
+            INNER JOIN fusion_methods fm ON fm.doi = p.doi
+            WHERE fm.description LIKE ? ORDER BY COALESCE(p.title, ''), p.doi
+        """
+    elif attribute == "u1":
+        sql = """
+            SELECT DISTINCT p.doi, p.title, p.author FROM papers p
+            INNER JOIN fusion_methods fm ON fm.doi = p.doi
+            WHERE fm.u1 LIKE ? ORDER BY COALESCE(p.title, ''), p.doi
+        """
+    elif attribute == "u3":
+        sql = """
+            SELECT DISTINCT p.doi, p.title, p.author FROM papers p
+            INNER JOIN fusion_methods fm ON fm.doi = p.doi
+            WHERE fm.u3 LIKE ? ORDER BY COALESCE(p.title, ''), p.doi
+        """
+    else:
+        return []
+
+    cur = conn.execute(sql, (term,))
     rows = cur.fetchall()
     return [{"doi": r[0], "title": r[1], "author": r[2]} for r in rows]
 
