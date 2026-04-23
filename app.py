@@ -221,11 +221,138 @@ def page_home():
             _render_paper_detail_filtered(conn, paper["doi"], show_key)
 
 
-def page_upload():
-    st.header("Upload Data")
+
+def page_queries():
+    st.header("Knowledge Queries")
+
+    with st.expander("Linkage Query", expanded=True):
+        st.caption(
+            "Find all fusion methods applied to papers that use both Dataset A and Dataset B"
+        )
+        c1, c2 = st.columns(2)
+        with c1:
+            da = st.text_input("Dataset A name", key="link_a")
+        with c2:
+            dataset_b = st.text_input("Dataset B name", key="link_b")
+        if st.button("Search", key="link_search"):
+            try:
+                conn = get_conn()
+                rows = query_linkage(conn, da, dataset_b)
+                if not rows:
+                    st.info("No matching fusion methods found.")
+                else:
+                    st.dataframe(
+                        pd.DataFrame(rows),
+                        use_container_width=True,
+                        hide_index=True,
+                    )
+            except Exception as e:
+                st.error(str(e))
+
+    with st.expander("Uncertainty Query", expanded=True):
+        st.caption(
+            "Find all papers reporting a specific uncertainty type for a given sensor/keyword"
+        )
+        umap = {
+            "U1 – Conception": "U1",
+            "U2 – Measurement": "U2",
+            "U3 – Analysis": "U3",
+        }
+        choice = st.selectbox(
+            "Uncertainty Type",
+            list(umap.keys()),
+        )
+        sk = st.text_input("Sensor or keyword to search", key="unc_kw")
+        if st.button("Search", key="unc_search"):
+            try:
+                conn = get_conn()
+                rows = query_uncertainty(conn, umap[choice], sk)
+                if not rows:
+                    st.info("No matching papers found.")
+                else:
+                    out = []
+                    for r in rows:
+                        out.append(
+                            {
+                                "Paper Title": r.get("title"),
+                                "Author": r.get("author"),
+                                "DOI": r.get("doi"),
+                                "Uncertainty Text": r.get("uncertainty_text"),
+                            }
+                        )
+                    st.dataframe(
+                        pd.DataFrame(out),
+                        use_container_width=True,
+                        hide_index=True,
+                    )
+            except Exception as e:
+                st.error(str(e))
+
+    with st.expander("Popular Dataset Query", expanded=True):
+        st.caption("Which dataset appears most often across fusion methods?")
+        if st.button("Run Query", key="pop_run"):
+            try:
+                conn = get_conn()
+                rows = query_popular_dataset(conn)
+                if not rows:
+                    st.info("No data available. Import a workbook first.")
+                else:
+                    df = pd.DataFrame(rows)
+                    st.dataframe(df, use_container_width=True, hide_index=True)
+                    chart_df = df[["data_name", "method_count"]].set_index("data_name")
+                    st.bar_chart(chart_df)
+            except Exception as e:
+                st.error(str(e))
+
+@st.dialog("Database Deletion Confirmation")
+def confirm_db_deletion():
+    st.warning("Are you sure you want to delete and reset the database? This action cannot be undone.")
+    if st.button("Yes, delete the database", type="primary"):
+        try:
+            st.cache_resource.clear()
+            delete_db(DB_PATH)
+            st.success("Database cleared.")
+            st.rerun()
+        except Exception as e:
+            st.error(str(e))
+    if st.button("No, keep the database"):
+        st.rerun()
+
+def page_db_mgmt():
+    st.header("Database Management")
+    abs_path = os.path.abspath(DB_PATH)
+    st.markdown(f"**Database file:** `{abs_path}`")
+
+    size = os.path.getsize(abs_path) if os.path.isfile(abs_path) else 0
+    st.markdown(f"**File size:** {size:,} bytes")
+
+    if st.button("Delete & Reset Database", type="primary"):
+        confirm_db_deletion()
+            
+    try:
+        conn = get_conn()
+        stats = get_stats(conn)
+        st.subheader("Row counts")
+        st.dataframe(
+            pd.DataFrame(
+                [
+                    {"table": "papers", "rows": stats["papers"]},
+                    {"table": "datasets", "rows": stats["datasets"]},
+                    {"table": "fusion_methods", "rows": stats["methods"]},
+                ]
+            ),
+            use_container_width=True,
+            hide_index=True,
+        )
+    except Exception as e:
+        st.error(str(e))
+
+    st.subheader("Upload Data")
     st.caption(
         "**Excel:** one `.xlsx` workbook with sheets **DOI**, **Data**, and **Fusion Method** (names matched flexibly). "
         "Import **replaces** rows for DOIs present in that workbook (same as before). "
+    )
+    st.caption(
         "**CSV (single or three files):** data is **merged by DOI** — existing rows are **enriched**: CSV only fills **empty** "
         "fields; values already stored are left unchanged. Child rows match on **(doi, data_name)** and **(doi, method_name)** "
         "so repeat uploads update the same record instead of duplicating."
@@ -394,126 +521,8 @@ def page_upload():
         "For CSV, upload **one** combined file, or **three** files (DOI.csv, Data.csv, Fusion Method.csv)."
     )
 
-
-def page_queries():
-    st.header("Knowledge Queries")
-
-    with st.expander("Linkage Query", expanded=True):
-        st.caption(
-            "Find all fusion methods applied to papers that use both Dataset A and Dataset B"
-        )
-        c1, c2 = st.columns(2)
-        with c1:
-            da = st.text_input("Dataset A name", key="link_a")
-        with c2:
-            dataset_b = st.text_input("Dataset B name", key="link_b")
-        if st.button("Search", key="link_search"):
-            try:
-                conn = get_conn()
-                rows = query_linkage(conn, da, dataset_b)
-                if not rows:
-                    st.info("No matching fusion methods found.")
-                else:
-                    st.dataframe(
-                        pd.DataFrame(rows),
-                        use_container_width=True,
-                        hide_index=True,
-                    )
-            except Exception as e:
-                st.error(str(e))
-
-    with st.expander("Uncertainty Query", expanded=True):
-        st.caption(
-            "Find all papers reporting a specific uncertainty type for a given sensor/keyword"
-        )
-        umap = {
-            "U1 – Conception": "U1",
-            "U2 – Measurement": "U2",
-            "U3 – Analysis": "U3",
-        }
-        choice = st.selectbox(
-            "Uncertainty Type",
-            list(umap.keys()),
-        )
-        sk = st.text_input("Sensor or keyword to search", key="unc_kw")
-        if st.button("Search", key="unc_search"):
-            try:
-                conn = get_conn()
-                rows = query_uncertainty(conn, umap[choice], sk)
-                if not rows:
-                    st.info("No matching papers found.")
-                else:
-                    out = []
-                    for r in rows:
-                        out.append(
-                            {
-                                "Paper Title": r.get("title"),
-                                "Author": r.get("author"),
-                                "DOI": r.get("doi"),
-                                "Uncertainty Text": r.get("uncertainty_text"),
-                            }
-                        )
-                    st.dataframe(
-                        pd.DataFrame(out),
-                        use_container_width=True,
-                        hide_index=True,
-                    )
-            except Exception as e:
-                st.error(str(e))
-
-    with st.expander("Popular Dataset Query", expanded=True):
-        st.caption("Which dataset appears most often across fusion methods?")
-        if st.button("Run Query", key="pop_run"):
-            try:
-                conn = get_conn()
-                rows = query_popular_dataset(conn)
-                if not rows:
-                    st.info("No data available. Import a workbook first.")
-                else:
-                    df = pd.DataFrame(rows)
-                    st.dataframe(df, use_container_width=True, hide_index=True)
-                    chart_df = df[["data_name", "method_count"]].set_index("data_name")
-                    st.bar_chart(chart_df)
-            except Exception as e:
-                st.error(str(e))
-
-
-def page_db_mgmt():
-    st.header("Database Management")
-    abs_path = os.path.abspath(DB_PATH)
-    st.markdown(f"**Database file:** `{abs_path}`")
-
-    size = os.path.getsize(abs_path) if os.path.isfile(abs_path) else 0
-    st.markdown(f"**File size:** {size:,} bytes")
-
-    st.warning("This will permanently delete all imported data.")
-    if st.button("Delete & Reset Database", type="primary"):
-        try:
-            st.cache_resource.clear()
-            delete_db(DB_PATH)
-            st.success("Database cleared.")
-            st.rerun()
-        except Exception as e:
-            st.error(str(e))
-
-    try:
-        conn = get_conn()
-        stats = get_stats(conn)
-        st.subheader("Row counts")
-        st.dataframe(
-            pd.DataFrame(
-                [
-                    {"table": "papers", "rows": stats["papers"]},
-                    {"table": "datasets", "rows": stats["datasets"]},
-                    {"table": "fusion_methods", "rows": stats["methods"]},
-                ]
-            ),
-            use_container_width=True,
-            hide_index=True,
-        )
-    except Exception as e:
-        st.error(str(e))
-
+    
+        
 
 def main():
     st.sidebar.title("Navigation")
@@ -521,7 +530,6 @@ def main():
         "Go to",
         [
             "Home / Dashboard",
-            "Upload Data",
             "Knowledge Queries",
             "Database Management",
         ],
@@ -530,8 +538,6 @@ def main():
 
     if page == "Home / Dashboard":
         page_home()
-    elif page == "Upload Data":
-        page_upload()
     elif page == "Knowledge Queries":
         page_queries()
     else:
